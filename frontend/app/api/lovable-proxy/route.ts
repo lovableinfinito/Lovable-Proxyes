@@ -2,126 +2,109 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 
-// Initialize Supabase admin client (server-side only)
+// Initialize Supabase admin client for logging
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-let currentTokenIndex = 0;
+// CORS Headers Configuration
+const corsHeaders = {
+    'Access-Control-Allow-Origin': '*', // For extensions, '*' is often needed or specific chrome-extension:// IDs
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+};
 
-async function getActiveTokens() {
-    const { data, error } = await supabase
-        .from('tokens')
-        .select('*')
-        .eq('status', 'active');
-
-    if (error) {
-        console.error('Error fetching tokens:', error);
-        return [];
-    }
-    return data;
-}
-
-async function markTokenInactive(id: string) {
-    await supabase.from('tokens').update({ status: 'inactive' }).eq('id', id);
+export async function OPTIONS() {
+    return NextResponse.json({}, { headers: corsHeaders });
 }
 
 export async function POST(req: NextRequest) {
-    return handleProxy(req);
-}
-
-export async function GET(req: NextRequest) {
-    return handleProxy(req);
-}
-
-export async function PUT(req: NextRequest) {
-    return handleProxy(req);
-}
-
-export async function PATCH(req: NextRequest) {
-    return handleProxy(req);
-}
-
-export async function DELETE(req: NextRequest) {
-    return handleProxy(req);
-}
-
-async function handleProxy(req: NextRequest) {
-    const tokens = await getActiveTokens();
-
-    if (!tokens || tokens.length === 0) {
-        return NextResponse.json({ error: 'No active tokens available in the pool' }, { status: 503 });
-    }
-
-    // Round-robin selection
-    currentTokenIndex = (currentTokenIndex + 1) % tokens.length;
-    const tokenData = tokens[currentTokenIndex];
-    const token = tokenData.token;
-
-    // Get body if exists
-    let body = null;
     try {
-        if (req.method !== 'GET' && req.method !== 'HEAD') {
-            body = await req.json();
-        }
-    } catch (e) {
-        // Body might not be JSON or empty
-    }
+        const body = await req.json();
+        const { projectId, token, message, files } = body;
 
-    // Forward headers (except host and authorization which we override)
-    const headers: Record<string, string> = {};
-    req.headers.forEach((value, key) => {
-        if (key.toLowerCase() !== 'host' && key.toLowerCase() !== 'authorization') {
-            headers[key] = value;
-        }
-    });
-    headers['Authorization'] = `Bearer ${token}`;
-
-    try {
-        const response = await axios({
-            method: req.method,
-            url: 'https://api.lovable.dev/v1/chat/completions', // Default target
-            data: body,
-            params: Object.fromEntries(req.nextUrl.searchParams),
-            headers: headers,
-            validateStatus: () => true
-        });
-
-        // Log the transaction in the background
-        supabase.from('logs').insert({
-            token_used: token.substring(0, 10) + '...',
-            request_method: req.method,
-            request_path: req.nextUrl.pathname,
-            response_status: response.status
-        }).then();
-
-        // Auto-deactivation of tokens with status 402/403
-        if (response.status === 402 || response.status === 403) {
-            console.log(`Token ${tokenData.id} auto-deactivated due to status ${response.status}`);
-            await markTokenInactive(tokenData.id);
+        // 1. Validate Input (PRD Rule)
+        if (!projectId || !token || !message) {
+            return NextResponse.json({
+                success: false,
+                error: 'Campos obrigatórios: projectId, token, message'
+            }, { status: 400, headers: corsHeaders });
         }
 
-        return new NextResponse(JSON.stringify(response.data), {
-            status: response.status,
-            headers: {
-                'Content-Type': 'application/json'
+        // 2. Prepare headers for Lovable API
+        const headers: Record<string, string> = {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'Lovable-Proxy-Infinity/1.0',
+        };
+
+        // 3. Logic: Call Lovable API
+        // Using the PRD suggested endpoint (Note: endpoint might vary based on Lovable's actual internal API)
+        const lovableEndpoint = 'https://api.lovable.dev/v1/chat/completions';
+
+        try {
+            const response = await axios({
+                method: 'POST',
+                url: lovableEndpoint,
+                data: {
+                    projectId,
+                    message,
+                    files: files || []
+                },
+                headers: headers,
+                timeout: 30000, // 30s Timeout (PRD Rule)
+                validateStatus: () => true // Handle all status codes
+            });
+
+            // 4. Log the transaction (Dashboard Sync)
+            supabase.from('logs').insert({
+                token_used: token.substring(0, 10) + '...',
+                request_method: 'POST',
+                request_path: '/api/lovable-proxy',
+                response_status: response.status
+            }).then();
+
+            // 5. Error Mapping Based on PRD
+            if (response.status === 401) {
+                return NextResponse.json({ success: false, error: 'Token inválido ou expirado' }, { status: 401, headers: corsHeaders });
             }
-        });
+            if (response.status === 402) {
+                return NextResponse.json({ success: false, error: 'Créditos insuficientes na conta' }, { status: 402, headers: corsHeaders });
+            }
+            if (response.status === 404) {
+                return NextResponse.json({ success: false, error: 'Projeto não encontrado' }, { status: 404, headers: corsHeaders });
+            }
+            if (response.status >= 500) {
+                return NextResponse.json({ success: false, error: 'Erro ao processar no Lovable' }, { status: 502, headers: corsHeaders });
+            }
 
-    } catch (error: any) {
-        console.error('Proxy network error:', error.message);
+            // 6. Success Response (PRD Formatted)
+            return NextResponse.json({
+                success: true,
+                content: response.data.content || response.data.reply || response.data.response || 'No content returned',
+                raw: response.data // Optional: keeping raw for debugging
+            }, {
+                status: response.status,
+                headers: corsHeaders
+            });
 
-        // Log the failure
-        await supabase.from('logs').insert({
-            token_used: token.substring(0, 10) + '...',
-            request_method: req.method,
-            request_path: req.nextUrl.pathname,
-            response_status: 500
-        });
+        } catch (apiError: any) {
+            console.error('Lovable API Connection Error:', apiError.message);
+            return NextResponse.json({
+                success: false,
+                error: 'Falha na conexão com a API do Lovable'
+            }, { status: 502, headers: corsHeaders });
+        }
 
+    } catch (parseError) {
         return NextResponse.json({
-            error: 'Proxy encountered a network error',
-            details: error.message
-        }, { status: 500 });
+            success: false,
+            error: 'Erro ao processar corpo da requisição (JSON inválido)'
+        }, { status: 400, headers: corsHeaders });
     }
+}
+
+// Support for other methods if needed, but PRD specifies POST
+export async function GET() {
+    return NextResponse.json({ success: false, error: 'Method not allowed. Use POST.' }, { status: 405, headers: corsHeaders });
 }
